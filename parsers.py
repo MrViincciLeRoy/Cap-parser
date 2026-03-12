@@ -63,27 +63,15 @@ class PDFParser:
 
     def _extract_with_pdfplumber(self, pdf_data, password=None):
         import pdfplumber
-        lines = []
+        pages = []
         open_kwargs = {"password": password} if password else {}
         with pdfplumber.open(io.BytesIO(pdf_data), **open_kwargs) as pdf:
             for page in pdf.pages:
-                # Try table extraction first — gives clean rows without wrapping artifacts
-                tables = page.extract_tables()
-                if tables:
-                    for table in tables:
-                        for row in table:
-                            if row:
-                                # Join non-None cells with spaces, treat None as empty
-                                cells = [str(c).strip() if c else '' for c in row]
-                                line = '  '.join(cells).strip()
-                                if line:
-                                    lines.append(line)
-                else:
-                    # Fallback to plain text for this page
-                    page_text = page.extract_text(x_tolerance=2, y_tolerance=2)
-                    if page_text:
-                        lines.append(page_text)
-        return '\n'.join(lines)
+                # Tight tolerances keep all columns on one line without merging rows
+                txt = page.extract_text(x_tolerance=1, y_tolerance=1)
+                if txt:
+                    pages.append(txt)
+        return '\n'.join(pages)
 
     def _extract_with_pypdf2(self, pdf_data, password=None):
         import PyPDF2
@@ -273,218 +261,165 @@ class PDFParser:
         return transactions
     
     def _parse_capitec(self, text):
-        """Parse Capitec PDF format - COMPLETELY FIXED VERSION
-        
-        Capitec format from your PDF:
-        Date | Description | Category | Money In | Money Out | Fee* | Balance
-        
-        Example lines:
-        01/10/2024 Recurring Transfer Insufficient Funds of R1 000.00 (16916070)
-        01/10/2024 DebiCheck Insufficient Funds (R66.65): Capitec/general (CF69253296)
-        21/10/2024 Payment Received: 1070143456004 Vault M Other Income 88.00 73.54
-        25/10/2024 Banking App Cash Sent: ******* Cash Withdrawal -50.00 -10.00 28.64
+        """Parse Capitec statement text (layout-extracted or plain text).
+
+        Capitec columns: Date | Description | Category | Money In | Money Out | Fee* | Balance
+        Amounts use space-separated thousands: 3 465.00 or 1 030.73
         """
         transactions = []
 
-        def parse_capitec_amount(amt_str):
-            if not amt_str or amt_str in ('-', ''):
+        CATEGORIES = [
+            'Investment Income', 'Other Income', 'Cash Withdrawal', 'Digital Payments',
+            'Furniture & Appliances', 'Other Personal & Family', 'Card Subscriptions',
+            'Debit Orders', 'Online Store',
+            'Transfer', 'Savings', 'Investments', 'Fees', 'Interest', 'Groceries',
+            'Cellphone', 'Uncategorised', 'Takeaways', 'Alcohol',
+        ]
+        CREDIT_KW = ['payment received', 'received', 'deposit', 'interest received',
+                     'transfer received', 'refund']
+        DEBIT_KW  = ['payment:', 'sent', 'cash sent', 'withdrawal', 'purchase',
+                     'transfer to', 'prepaid', 'voucher', 'debicheck', 'insufficient funds']
+
+        AMT = r'-?(?:0|[1-9]\d{0,2})(?:[, ]\d{3})*(?:\.\d{2})?\*?'
+
+        def parse_amt(s):
+            if not s:
                 return 0.0
             try:
-                return float(amt_str.replace(',', '').replace(' ', '').strip())
-            except (ValueError, AttributeError):
+                return float(re.sub(r'[, \*]', '', s).strip())
+            except ValueError:
                 return 0.0
 
-        category_keywords = ['Income', 'Savings', 'Withdrawal', 'Transfer', 'Payments',
-                              'Cellphone', 'Uncategorised', 'Investments', 'Fees', 'Interest',
-                              'Groceries', 'Digital', 'Takeaways']
-        credit_keywords = ['payment received', 'received', 'deposit', 'interest received',
-                           'transfer received', 'refund']
-        debit_keywords = ['payment:', 'sent', 'cash sent', 'withdrawal', 'purchase',
-                          'transfer to', 'prepaid', 'voucher', 'debicheck', 'insufficient funds']
-
-        def classify(description, category, trans_amount):
-            desc_lower = description.lower()
-            if any(k in desc_lower for k in credit_keywords):
-                return 'credit', abs(trans_amount)
-            if any(k in desc_lower for k in debit_keywords):
-                return 'debit', abs(trans_amount)
-            if 'income' in category.lower():
-                return 'credit', abs(trans_amount)
-            return ('credit' if trans_amount > 0 else 'debit'), abs(trans_amount)
+        def strip_amts_right(s, max_amts=3):
+            """Peel up to max_amts amount tokens from the right. Returns (text, [amt_strs])."""
+            amts = []
+            while len(amts) < max_amts:
+                m = re.search(rf'(?<![.\d])({AMT})\s*$', s)
+                if not m:
+                    break
+                amts.insert(0, m.group(1))
+                s = s[:m.start()].rstrip()
+            return s, amts
 
         def extract_category(text_block):
-            parts = text_block.split()
-            for idx in range(len(parts) - 1, -1, -1):
-                if parts[idx] in category_keywords:
-                    if idx > 0 and parts[idx - 1] in category_keywords:
-                        return ' '.join(parts[idx - 1:idx + 1]), ' '.join(parts[:idx - 1])
-                    return parts[idx], ' '.join(parts[:idx])
+            text_block = text_block.strip()
+            for cat in CATEGORIES:
+                if text_block == cat:
+                    return cat, ''
+                if text_block.endswith(' ' + cat):
+                    return cat, text_block[:-len(cat)-1].rstrip()
             return 'Uncategorised', text_block
 
-        def append_txn(trans_date, description, category, trans_amount, fee, balance):
+        def append_txn(trans_date, description, category, amounts):
+            if len(amounts) == 3:
+                trans, fee, balance = parse_amt(amounts[0]), parse_amt(amounts[1]), parse_amt(amounts[2])
+            elif len(amounts) == 2:
+                trans, fee, balance = parse_amt(amounts[0]), 0.0, parse_amt(amounts[1])
+            elif len(amounts) == 1:
+                trans, fee, balance = parse_amt(amounts[0]), 0.0, 0.0
+            else:
+                return
+
             description = description.strip()
-            if abs(trans_amount) > 0 and len(description) >= 3:
-                t_type, amount = classify(description, category, trans_amount)
-                transactions.append({
-                    'date': trans_date,
-                    'description': description,
-                    'amount': amount,
-                    'type': t_type,
-                    'reference': f"CAP-{trans_date.strftime('%Y%m%d')}-{len(transactions)}",
-                    'category': category,
-                    'fee': abs(fee),
-                    'balance': balance,
-                })
-                logger.debug(f"Parsed Capitec: {description[:40]} = {amount} ({t_type})")
+            if abs(trans) == 0 or len(description) < 3:
+                return
 
-        # ── Table-extracted path ─────────────────────────────────────────────
-        # pdfplumber table extraction yields lines like:
-        #   "22/10/2025  Banking App Transfer from Live Savings  Transfer  -300.00  -2.00  123.45"
-        # Cells are separated by 2+ spaces; we split on that.
-        date_pat = re.compile(r'^\d{2}/\d{2}/\d{4}$')
-        amt_pat  = re.compile(r'^-?\d{1,3}(?:,\d{3})*(?:\.\d{2})?$')
+            # Amount sign is authoritative: negative = debit, positive = credit
+            if trans < 0:
+                t_type = 'debit'
+            elif trans > 0:
+                t_type = 'credit'
+            else:
+                # Zero or ambiguous — fall back to keywords
+                desc_lower = description.lower()
+                if any(k in desc_lower for k in CREDIT_KW) or 'income' in category.lower():
+                    t_type = 'credit'
+                else:
+                    t_type = 'debit'
 
-        table_rows = []
-        for raw in text.split('\n'):
-            cells = [c.strip() for c in re.split(r'  +', raw.strip()) if c.strip()]
-            if cells and date_pat.match(cells[0]):
-                table_rows.append(cells)
+            transactions.append({
+                'date': trans_date,
+                'description': description,
+                'amount': abs(trans),
+                'type': t_type,
+                'reference': f"CAP-{trans_date.strftime('%Y%m%d')}-{len(transactions)}",
+                'category': category,
+                'fee': abs(fee),
+                'balance': balance,
+            })
+            logger.debug(f"Capitec: {description[:45]} = {abs(trans)} ({t_type})")
 
-        if table_rows:
-            logger.info(f"Using table-extracted path: {len(table_rows)} rows")
-            for cells in table_rows:
-                try:
-                    trans_date = datetime.strptime(cells[0], '%d/%m/%Y').date()
-                    # Find amount cells from the right
-                    # Capitec cols: Date | Description | Category | MoneyIn/Out | Fee | Balance
-                    amt_cells = []
-                    text_cells = []
-                    for c in cells[1:]:
-                        if amt_pat.match(c):
-                            amt_cells.append(c)
-                        else:
-                            text_cells.append(c)
-
-                    if len(amt_cells) < 2:
-                        continue  # not enough data
-
-                    balance    = parse_capitec_amount(amt_cells[-1])
-                    fee        = parse_capitec_amount(amt_cells[-2]) if len(amt_cells) >= 3 else 0.0
-                    trans_amount = parse_capitec_amount(amt_cells[-3]) if len(amt_cells) >= 3 else parse_capitec_amount(amt_cells[-2])
-
-                    full_text = ' '.join(text_cells)
-                    category, description = extract_category(full_text)
-                    append_txn(trans_date, description, category, trans_amount, fee, balance)
-
-                except (ValueError, IndexError) as e:
-                    logger.warning(f"Table row parse error: {e} — {cells}")
-
-            if transactions:
-                logger.info(f"Table path yielded {len(transactions)} transactions")
-                return transactions
-            logger.warning("Table path found rows but produced no transactions, falling back to text path")
-
-        # ── Text-based path (fallback) ────────────────────────────────────────
         lines = text.split('\n')
-
-        amt_re = r'-?\d{1,3}(?:,\d{3})*(?:\.\d{2})?'
-        pure3_pat = re.compile(rf'^({amt_re})\s+({amt_re})\s+({amt_re})\s*$')
-        pure2_pat = re.compile(rf'^({amt_re})\s+({amt_re})\s*$')
-        desc3_pat = re.compile(rf'^(.+?)\s+({amt_re})\s+({amt_re})\s+({amt_re})\s*$')
-        desc2_pat = re.compile(rf'^(.+?)\s+({amt_re})\s+({amt_re})\s*$')
-
         i = 0
         while i < len(lines):
             line = lines[i].strip()
 
-            if not line or 'Transaction History' in line or 'Money In' in line or 'Money Out' in line:
+            skip_phrases = ('Transaction History', '* Includes VAT', '24hr Client',
+                            'Capitec Bank is', 'Unique Document', 'Date Description',
+                            'Spending Summary', 'Scheduled Payments', 'Debit Orders',
+                            'Card Subscriptions', 'Money In Summary', 'Money Out Summary',
+                            'Fee Summary', 'Live Better')
+            if not line or any(p in line for p in skip_phrases):
                 i += 1
                 continue
 
-            date_match = re.match(r'^(\d{2}/\d{2}/\d{4})\s+(.+)', line)
-            if not date_match:
+            # Skip lines with -R prefix amounts (summary sections, not transaction history)
+            if re.search(r'-R\d', line):
+                i += 1
+                continue
+
+            date_m = re.match(r'^(\d{2}/\d{2}/\d{4})\s+(.+)', line)
+            if not date_m:
                 i += 1
                 continue
 
             try:
-                trans_date = datetime.strptime(date_match.group(1), '%d/%m/%Y').date()
-                rest = date_match.group(2).strip()
+                trans_date = datetime.strptime(date_m.group(1), '%d/%m/%Y').date()
+                rest = date_m.group(2).strip()
 
-                # Try 3-amount match on the same line first
-                m = desc3_pat.match(rest)
-                if m:
-                    cat, desc = extract_category(m.group(1))
-                    append_txn(trans_date, desc, cat,
-                               parse_capitec_amount(m.group(2)),
-                               parse_capitec_amount(m.group(3)),
-                               parse_capitec_amount(m.group(4)))
-                    i += 1
-                    continue
+                desc_cat, amounts = strip_amts_right(rest)
 
-                # Try 2-amount match on same line
-                m = desc2_pat.match(rest)
-                if m:
-                    cat, desc = extract_category(m.group(1))
-                    append_txn(trans_date, desc, cat,
-                               parse_capitec_amount(m.group(2)),
-                               0.0,
-                               parse_capitec_amount(m.group(3)))
-                    i += 1
-                    continue
+                if amounts:
+                    # Extract category BEFORE absorbing any continuation (ref numbers etc.)
+                    cat, desc = extract_category(desc_cat)
+                    append_txn(trans_date, desc, cat, amounts)
 
-                # No amounts on this line — scan ahead up to 6 lines
-                j = i + 1
-                extra_desc = []
-                found = False
-                while j < len(lines) and j < i + 7:
-                    nxt = lines[j].strip()
-                    if not nxt:
-                        j += 1
-                        continue
-                    if re.match(r'^\d{2}/\d{2}/\d{4}', nxt):
-                        break
-
-                    for pat, use_fee in [(pure3_pat, True), (desc3_pat, True),
-                                        (pure2_pat, False), (desc2_pat, False)]:
-                        m = pat.match(nxt)
-                        if m:
-                            g = m.groups()
-                            if pat in (desc3_pat, desc2_pat):
-                                extra_desc.append(g[0].strip())
-                                g = g[1:]
-                            full = (rest + ' ' + ' '.join(extra_desc)).strip()
+                else:
+                    # No amounts on date line — scan up to 6 lines ahead
+                    j = i + 1
+                    extra = []
+                    found = False
+                    while j < len(lines) and j < i + 7:
+                        nxt = lines[j].strip()
+                        if not nxt:
+                            j += 1
+                            continue
+                        if re.match(r'\d{2}/\d{2}/\d{4}', nxt):
+                            break
+                        nxt_text, nxt_amts = strip_amts_right(nxt)
+                        if nxt_amts:
+                            full = ' '.join(filter(None, [rest] + extra + ([nxt_text] if nxt_text else [])))
                             cat, desc = extract_category(full)
-                            if use_fee:
-                                append_txn(trans_date, desc, cat,
-                                           parse_capitec_amount(g[0]),
-                                           parse_capitec_amount(g[1]),
-                                           parse_capitec_amount(g[2]))
-                            else:
-                                append_txn(trans_date, desc, cat,
-                                           parse_capitec_amount(g[0]),
-                                           0.0,
-                                           parse_capitec_amount(g[1]))
+                            append_txn(trans_date, desc, cat, nxt_amts)
                             i = j
                             found = True
                             break
-                    if found:
-                        break
-                    extra_desc.append(nxt)
-                    j += 1
+                        extra.append(nxt)
+                        j += 1
 
             except (ValueError, IndexError) as e:
-                logger.warning(f"Capitec text-path parse error: {e} — {line}")
-            
+                logger.warning(f"Capitec parse error: {e} — {line}")
+
             i += 1
-        
+
         if not transactions:
-            logger.warning("No transactions found with Capitec pattern")
-            logger.debug(f"Text sample:\n{text[:1000]}")
+            logger.warning("No Capitec transactions found")
+            logger.debug(f"Text sample:\n{text[:500]}")
         else:
-            logger.info(f"Successfully parsed {len(transactions)} Capitec transactions")
-        
+            logger.info(f"Parsed {len(transactions)} Capitec transactions")
+
         return transactions
-    
+
     def _parse_generic(self, text):
         """Generic PDF parsing for unknown banks"""
         transactions = []
