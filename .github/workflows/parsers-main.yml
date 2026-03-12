@@ -1,0 +1,108 @@
+name: Parse Bank Statement
+
+on:
+  push:
+    paths:
+      - 'data/**.pdf'
+      - 'parsers.py'
+  workflow_dispatch:
+    inputs:
+      pdf_filename:
+        description: 'PDF filename inside data/ folder'
+        required: false
+        default: ''
+      bank:
+        description: 'Bank name (capitec, tymebank, other)'
+        required: false
+        default: 'capitec'
+
+jobs:
+  parse:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install pdfplumber PyPDF2
+
+      - name: Find PDF and run parser
+        env:
+          PDF_FILENAME: ${{ github.event.inputs.pdf_filename }}
+          BANK: ${{ github.event.inputs.bank || 'capitec' }}
+        run: |
+          python - <<'EOF'
+          import os
+          import sys
+          import json
+          from pathlib import Path
+          from parsers import PDFParser
+
+          data_dir = Path("data")
+          pdf_filename = os.environ.get("PDF_FILENAME", "").strip()
+          bank = os.environ.get("BANK", "capitec").strip()
+
+          # If no filename given, pick the most recently modified PDF in data/
+          if pdf_filename:
+              pdf_path = data_dir / pdf_filename
+          else:
+              pdfs = sorted(data_dir.glob("*.pdf"), key=lambda p: p.stat().st_mtime, reverse=True)
+              if not pdfs:
+                  print("No PDF files found in data/")
+                  sys.exit(1)
+              pdf_path = pdfs[0]
+              print(f"No filename specified — using most recent: {pdf_path.name}")
+
+          if not pdf_path.exists():
+              print(f"PDF not found: {pdf_path}")
+              sys.exit(1)
+
+          print(f"Parsing: {pdf_path}  (bank={bank})")
+          parser = PDFParser()
+          transactions = parser.parse_pdf(pdf_path.read_bytes(), bank)
+
+          if not transactions:
+              print("No transactions parsed.")
+              sys.exit(1)
+
+          # Group by date for display
+          by_date = {}
+          for t in transactions:
+              key = str(t['date'])
+              by_date.setdefault(key, []).append(t)
+
+          total_credit = sum(t['amount'] for t in transactions if t['type'] == 'credit')
+          total_debit  = sum(t['amount'] for t in transactions if t['type'] == 'debit')
+
+          print(f"\n{'='*60}")
+          print(f"  Total transactions : {len(transactions)}")
+          print(f"  Total credits      : R{total_credit:,.2f}")
+          print(f"  Total debits       : R{total_debit:,.2f}")
+          print(f"{'='*60}\n")
+
+          for date, txns in sorted(by_date.items()):
+              print(f"── {date} ─────────────────────────")
+              for t in txns:
+                  sign  = "+" if t['type'] == 'credit' else "-"
+                  fee   = f"  fee=R{t.get('fee',0):.2f}" if t.get('fee') else ""
+                  print(f"  [{sign}] R{t['amount']:>10,.2f}{fee}  |  {t.get('category',''):<18}  {t['description'][:50]}")
+
+          # Save results as JSON artifact
+          out = Path("data/parsed_transactions.json")
+          serialisable = [{**t, 'date': str(t['date'])} for t in transactions]
+          out.write_text(json.dumps(serialisable, indent=2))
+          print(f"\nSaved {len(transactions)} transactions → {out}")
+          EOF
+
+      - name: Upload parsed results
+        uses: actions/upload-artifact@v4
+        with:
+          name: parsed-transactions
+          path: data/parsed_transactions.json
+          if-no-files-found: warn
